@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: country-quest-backend
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+    healthCheckPath: /health
+    autoDeploy: true
