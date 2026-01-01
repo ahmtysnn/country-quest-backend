@@ -130,17 +130,11 @@ const COUNTRIES_AND_CITIES = [
 ];
 
 const CLUE_SCHEDULE_KEYS = [
-  'region',
-  'main_export',
-  'population',
-  'currency',
-  'language',
-  'fun_fact',
-  'cities',
-  'flag'
+  'region', 'main_export', 'population', 'currency', 
+  'language', 'fun_fact', 'cities', 'flag'
 ];
 
-const CLUE_DURATION = 15; // seconds per clue
+const CLUE_DURATION_MS = 15000; // 15 seconds in MS
 const MAX_PLAYERS = 2;
 
 // ============================================================================
@@ -149,33 +143,23 @@ const MAX_PLAYERS = 2;
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Add these endpoints FIRST
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
-
-app.get('/', (req, res) => {
-  res.json({ 
-    message: 'Country Quest Backend API',
-    status: 'running',
-    socket: true,
-    timestamp: new Date().toISOString()
-  });
-});
+app.get('/health', (req, res) => res.status(200).send('OK'));
+app.get('/', (req, res) => res.json({ status: 'running', mode: 'fast-socket' }));
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// Create HTTP server
 const server = http.createServer(app);
 
-// Initialize Socket.io
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "*",
+    origin: "*", // Allow all for now, lock down in production if needed
     methods: ["GET", "POST"],
     credentials: true
-  }
+  },
+  // OPTIMIZATION: Faster ping interval to detect disconnects quicker
+  pingTimeout: 10000,
+  pingInterval: 5000 
 });
 
 // ============================================================================
@@ -184,28 +168,29 @@ const io = new Server(server, {
 class GameRoom {
   constructor(roomId) {
     this.roomId = roomId;
-    this.players = []; // Array of socket IDs. Index 0 is Player 1 (Host)
+    this.players = []; 
     this.gameActive = false;
     this.scores = { p1: 0, p2: 0 };
     this.currentCountry = null;
     this.clueIndex = 0;
-    this.timer = CLUE_DURATION;
-    this.interval = null;
+    
+    // Instead of interval ticking, we use timeouts + timestamps
+    this.clueTimeout = null;
+    this.clueEndTime = 0;
+    
     this.createdAt = Date.now();
-    this.readyPlayers = new Set(); // Track which socket IDs are ready
+    this.readyPlayers = new Set();
   }
 
   addPlayer(socketId) {
     if (this.players.length >= MAX_PLAYERS) return null;
     this.players.push(socketId);
-    return this.players.length; // Returns 1 or 2
+    return this.players.length; 
   }
 
   removePlayer(socketId) {
     const index = this.players.indexOf(socketId);
-    if (index > -1) {
-      this.players.splice(index, 1);
-    }
+    if (index > -1) this.players.splice(index, 1);
     this.readyPlayers.delete(socketId);
     return this.players.length;
   }
@@ -223,26 +208,22 @@ class GameRoom {
     const randomIndex = Math.floor(Math.random() * COUNTRIES_AND_CITIES.length);
     this.currentCountry = COUNTRIES_AND_CITIES[randomIndex];
     this.clueIndex = 0;
-    this.timer = CLUE_DURATION;
     this.gameActive = true;
-    
-    // Clear ready status so they have to ready up again if they go back to lobby
-    // (Though for 'Restart' we bypass this check)
     this.readyPlayers.clear();
   }
 
   stopGame() {
     this.gameActive = false;
-    if (this.interval) {
-      clearInterval(this.interval);
-      this.interval = null;
+    if (this.clueTimeout) {
+      clearTimeout(this.clueTimeout);
+      this.clueTimeout = null;
     }
   }
 }
 
 const rooms = new Map();
 
-// Cleanup interval
+// Cleanup stale rooms
 setInterval(() => {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
@@ -254,22 +235,16 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ============================================================================
-// SOCKET.IO LOGIC
+// SOCKET LOGIC
 // ============================================================================
 io.on('connection', (socket) => {
-  console.log(`✅ Player connected: ${socket.id}`);
+  console.log(`⚡ Fast Socket connected: ${socket.id}`);
 
-  // JOIN ROOM
   socket.on('join_room', (roomId) => {
     if (!roomId) return;
-    
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, new GameRoom(roomId));
-      console.log(`📦 Created room: ${roomId}`);
-    }
+    if (!rooms.has(roomId)) rooms.set(roomId, new GameRoom(roomId));
 
     const room = rooms.get(roomId);
-
     if (room.players.length >= MAX_PLAYERS) {
       socket.emit('error_message', 'Room is full!');
       return;
@@ -279,22 +254,17 @@ io.on('connection', (socket) => {
     socket.join(roomId);
     socket.emit('player_assigned', playerNum);
 
-    console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
-
     if (room.players.length === MAX_PLAYERS) {
-      io.to(roomId).emit('room_ready'); // Moves users to "Waiting" screen
+      io.to(roomId).emit('room_ready');
     }
   });
 
-  // TOGGLE READY (Lobby Phase)
   socket.on('toggle_ready', ({ roomId, isReady }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
     room.setReady(socket.id, isReady);
 
-    // Send updated statuses to everyone in room
-    // Map socket IDs to P1/P2 ready booleans
     const p1Socket = room.players[0];
     const p2Socket = room.players[1];
 
@@ -303,64 +273,64 @@ io.on('connection', (socket) => {
       p2: room.readyPlayers.has(p2Socket)
     });
 
-    // Check if game should start
     if (room.areAllReady()) {
-      console.log(`🚀 All players ready in ${roomId}. Starting game...`);
       startGameLoop(room);
     }
   });
 
-  // RESTART GAME (Game Over Phase)
   socket.on('restart_game', (roomId) => {
     const room = rooms.get(roomId);
     if (!room) return;
-
-    // Only Player 1 (index 0) is allowed to restart
-    if (room.players[0] !== socket.id) {
-        socket.emit('error_message', "Only the Host (Player 1) can restart.");
-        return;
-    }
-
-    console.log(`🔄 Host restarted game in ${roomId}`);
+    if (room.players[0] !== socket.id) return; // Only host
     startGameLoop(room);
   });
 
-  // GAME LOOP HELPER
+  // --- OPTIMIZED GAME LOOP ---
   function startGameLoop(room) {
     room.stopGame();
     room.startNewRound();
 
-    // Notify clients game started
+    // Calculate exact finish time for synchronization
+    const now = Date.now();
+    room.clueEndTime = now + CLUE_DURATION_MS;
+
     io.to(room.roomId).emit('game_started', {
       countryData: room.currentCountry,
-      clueIndex: room.clueIndex
+      clueIndex: room.clueIndex,
+      endsAt: room.clueEndTime // Send timestamp, not "15 seconds"
     });
 
-    // Timer Loop
-    room.interval = setInterval(() => {
-      if (!room.gameActive) {
-        clearInterval(room.interval);
-        return;
-      }
-
-      room.timer--;
-      io.to(room.roomId).emit('timer_update', room.timer);
-
-      if (room.timer <= 0) {
-        // Move to next clue
-        if (room.clueIndex < CLUE_SCHEDULE_KEYS.length - 1) {
-          room.clueIndex++;
-          room.timer = CLUE_DURATION;
-          io.to(room.roomId).emit('next_clue', room.clueIndex);
-        } else {
-          // Game Over (Draw)
-          finishGame(room, 'draw');
-        }
-      }
-    }, 1000);
+    scheduleNextPhase(room);
   }
 
-  // FINISH GAME HELPER
+  function scheduleNextPhase(room) {
+    if (room.clueTimeout) clearTimeout(room.clueTimeout);
+
+    room.clueTimeout = setTimeout(() => {
+      if (!room.gameActive) return;
+
+      // Move to next clue
+      if (room.clueIndex < CLUE_SCHEDULE_KEYS.length - 1) {
+        room.clueIndex++;
+        
+        // Update timestamp
+        room.clueEndTime = Date.now() + CLUE_DURATION_MS;
+        
+        // Broadcast Update
+        io.to(room.roomId).emit('next_clue', {
+          index: room.clueIndex,
+          endsAt: room.clueEndTime
+        });
+
+        // Recurse
+        scheduleNextPhase(room);
+      } else {
+        // Game Over (Draw)
+        finishGame(room, 'draw');
+      }
+    }, CLUE_DURATION_MS);
+  }
+
   function finishGame(room, winner) {
     room.stopGame();
     io.to(room.roomId).emit('game_over', {
@@ -370,7 +340,6 @@ io.on('connection', (socket) => {
     });
   }
 
-  // GUESS HANDLING
   socket.on('send_guess', ({ roomId, guess, playerNum }) => {
     const room = rooms.get(roomId);
     if (!room || !room.gameActive) return;
@@ -380,39 +349,31 @@ io.on('connection', (socket) => {
     const attempt = normalize(guess);
 
     if (attempt === target) {
-      // Correct!
       const winner = playerNum === 1 ? 'player1' : 'player2';
       if (winner === 'player1') room.scores.p1++;
       else room.scores.p2++;
-      
       finishGame(room, winner);
     } else {
-      // Incorrect - show bubble
+      // Immediate broadcast of wrong guess
       socket.to(roomId).emit('opponent_guess', guess);
     }
   });
 
-  // DISCONNECT
   socket.on('disconnect', () => {
-    console.log(`❌ Disconnected: ${socket.id}`);
     for (const [roomId, room] of rooms.entries()) {
       if (room.players.includes(socket.id)) {
         room.removePlayer(socket.id);
-        
-        // Notify clients to reset UI if someone leaves
         io.to(roomId).emit('player_left');
+        room.stopGame();
         
-        // Broadcast new ready states (in case the ready person left)
-        const p1Socket = room.players[0];
-        const p2Socket = room.players[1]; // likely undefined now
-        io.to(roomId).emit('ready_state_update', {
-            p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
-            p2: false
-        });
-
-        if (room.players.length === 0) {
-          room.stopGame();
-          rooms.delete(roomId);
+        if (room.players.length === 0) rooms.delete(roomId);
+        else {
+           // Update ready states if someone remains
+           const p1Socket = room.players[0];
+           io.to(roomId).emit('ready_state_update', {
+               p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
+               p2: false
+           });
         }
       }
     }
@@ -421,6 +382,4 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`✅ Health check: http://localhost:${PORT}/health`);
-  console.log(`✅ Socket.IO ready`);
 });
