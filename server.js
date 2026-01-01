@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const { COUNTRIES_AND_CITIES } = require('./countries_and_cities');
+const { COUNTRIES_AND_CITIES } = require('./CountriesAndCities');
 
 const CLUE_SCHEDULE_KEYS = [
   'region',
