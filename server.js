@@ -2,53 +2,77 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const { COUNTRIES_AND_CITIES } = require('./CountriesAndCities');
 
 const CLUE_DURATION = 15; // seconds per clue
 const MAX_PLAYERS = 2;
 
+// Fix: Add missing CLUE_SCHEDULE_KEYS
+const CLUE_SCHEDULE_KEYS = [
+  'region',
+  'main_export', 
+  'population',
+  'currency',
+  'language',
+  'fun_fact',
+  'cities',
+  'flag'
+];
+
+// Import your data
+const { COUNTRIES_AND_CITIES } = require('./CountriesAndCities');
+
 // ============================================================================
-// EXPRESS & SOCKET.IO SETUP
+// EXPRESS & SOCKET.IO SETUP - OPTIMIZED
 // ============================================================================
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors({ origin: "*" }));
+// Middleware - ORDER MATTERS!
+app.use(cors({ 
+  origin: process.env.CLIENT_URL || "*",
+  credentials: true 
+}));
 app.use(express.json());
 
+// Health endpoints
 app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+  res.status(200).json({ 
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    connections: io.engine?.clientsCount || 0
+  });
 });
 
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'Country Quest Backend API', 
-    status: 'running', 
+    message: 'Country Quest Backend API',
+    status: 'running',
     socket: true,
-    mode: 'websocket-only'
+    environment: process.env.NODE_ENV || 'development',
+    timestamp: new Date().toISOString()
   });
 });
 
 // Create HTTP server
 const server = http.createServer(app);
 
-// Initialize Socket.io with HIGH PERFORMANCE settings
+// Initialize Socket.io with OPTIMIZED settings
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all for smoother connectivity
+    origin: process.env.CLIENT_URL || "*",
     methods: ["GET", "POST"],
     credentials: true
   },
-  // CRITICAL: Force WebSocket to avoid polling delays
-  transports: ['websocket', 'polling'], 
-  // Detect disconnects quickly (default is too slow)
-  pingTimeout: 10000, 
-  pingInterval: 10000,
-  // Helper for mobile/bad connections
+  transports: ['websocket', 'polling'], // Allow both
+  pingTimeout: 60000, // Increase timeout
+  pingInterval: 25000, // Send pings every 25 seconds
+  connectTimeout: 45000, // Connection timeout
+  maxHttpBufferSize: 1e8, // 100MB max buffer
+  allowEIO3: true, // Support older Engine.IO clients
+  
+  // Connection optimization
   connectionStateRecovery: {
-    // the backup duration of the sessions and the packets
-    maxDisconnectionDuration: 2 * 60 * 1000,
-    // whether to skip middlewares upon successful recovery
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
     skipMiddlewares: true,
   }
 });
@@ -59,7 +83,7 @@ const io = new Server(server, {
 class GameRoom {
   constructor(roomId) {
     this.roomId = roomId;
-    this.players = []; 
+    this.players = []; // Array of socket IDs. Index 0 is Player 1 (Host)
     this.gameActive = false;
     this.scores = { p1: 0, p2: 0 };
     this.currentCountry = null;
@@ -67,13 +91,13 @@ class GameRoom {
     this.timer = CLUE_DURATION;
     this.interval = null;
     this.createdAt = Date.now();
-    this.readyPlayers = new Set();
+    this.readyPlayers = new Set(); // Track which socket IDs are ready
   }
 
   addPlayer(socketId) {
     if (this.players.length >= MAX_PLAYERS) return null;
     this.players.push(socketId);
-    return this.players.length; 
+    return this.players.length; // Returns 1 or 2
   }
 
   removePlayer(socketId) {
@@ -91,7 +115,8 @@ class GameRoom {
   }
 
   areAllReady() {
-    return this.players.length === MAX_PLAYERS && this.readyPlayers.size === MAX_PLAYERS;
+    return this.players.length === MAX_PLAYERS && 
+           this.readyPlayers.size === MAX_PLAYERS;
   }
 
   startNewRound() {
@@ -100,6 +125,8 @@ class GameRoom {
     this.clueIndex = 0;
     this.timer = CLUE_DURATION;
     this.gameActive = true;
+    
+    // Clear ready status
     this.readyPlayers.clear();
   }
 
@@ -121,19 +148,34 @@ setInterval(() => {
     if (room.players.length === 0 && now - room.createdAt > 30 * 60 * 1000) {
       room.stopGame();
       rooms.delete(roomId);
+      console.log(`🧹 Cleaned up empty room: ${roomId}`);
     }
   }
 }, 5 * 60 * 1000);
 
 // ============================================================================
-// SOCKET.IO LOGIC
+// SOCKET.IO LOGIC - OPTIMIZED
 // ============================================================================
+
 io.on('connection', (socket) => {
-  console.log(`⚡ Fast Connect: ${socket.id}`);
+  console.log(`✅ Player connected: ${socket.id} from ${socket.handshake.address}`);
+  
+  // Heartbeat to keep connection alive
+  socket.conn.on("packet", (packet) => {
+    if (packet.type === "pong") {
+      socket.data.lastPong = Date.now();
+    }
+  });
 
   // JOIN ROOM
   socket.on('join_room', (roomId) => {
-    if (!roomId) return;
+    if (!roomId || typeof roomId !== 'string') {
+      socket.emit('error_message', 'Invalid room ID');
+      return;
+    }
+    
+    // Clean room ID
+    roomId = roomId.trim().toLowerCase();
     
     if (!rooms.has(roomId)) {
       rooms.set(roomId, new GameRoom(roomId));
@@ -142,12 +184,6 @@ io.on('connection', (socket) => {
 
     const room = rooms.get(roomId);
 
-    // If player is already in this room (reconnection logic), don't add them again
-    if (room.players.includes(socket.id)) {
-        socket.emit('player_assigned', room.players.indexOf(socket.id) + 1);
-        return;
-    }
-
     if (room.players.length >= MAX_PLAYERS) {
       socket.emit('error_message', 'Room is full!');
       return;
@@ -155,22 +191,30 @@ io.on('connection', (socket) => {
 
     const playerNum = room.addPlayer(socket.id);
     socket.join(roomId);
+    socket.data.roomId = roomId;
+    socket.data.playerNum = playerNum;
+    
     socket.emit('player_assigned', playerNum);
-
     console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
 
     if (room.players.length === MAX_PLAYERS) {
-      io.to(roomId).emit('room_ready'); 
+      io.to(roomId).emit('room_ready'); // Moves users to "Waiting" screen
     }
   });
 
-  // TOGGLE READY 
+  // TOGGLE READY (Lobby Phase)
   socket.on('toggle_ready', ({ roomId, isReady }) => {
+    if (!roomId) return;
+    
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room) {
+      socket.emit('error_message', 'Room not found');
+      return;
+    }
 
     room.setReady(socket.id, isReady);
 
+    // Send updated statuses
     const p1Socket = room.players[0];
     const p2Socket = room.players[1];
 
@@ -179,109 +223,158 @@ io.on('connection', (socket) => {
       p2: room.readyPlayers.has(p2Socket)
     });
 
+    // Check if game should start
     if (room.areAllReady()) {
+      console.log(`🚀 All players ready in ${roomId}. Starting game...`);
       startGameLoop(room);
     }
   });
 
-  // RESTART GAME 
+  // RESTART GAME (Game Over Phase)
   socket.on('restart_game', (roomId) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
+    // Only Player 1 (index 0) is allowed to restart
     if (room.players[0] !== socket.id) {
         socket.emit('error_message', "Only the Host (Player 1) can restart.");
         return;
     }
+
+    console.log(`🔄 Host restarted game in ${roomId}`);
     startGameLoop(room);
   });
-
-  // GAME LOOP HELPER
-  function startGameLoop(room) {
-    room.stopGame();
-    room.startNewRound();
-
-    io.to(room.roomId).emit('game_started', {
-      countryData: room.currentCountry,
-      clueIndex: room.clueIndex
-    });
-
-    room.interval = setInterval(() => {
-      if (!room.gameActive) {
-        clearInterval(room.interval);
-        return;
-      }
-
-      room.timer--;
-      io.to(room.roomId).emit('timer_update', room.timer);
-
-      if (room.timer <= 0) {
-        if (room.clueIndex < 7) { // Hardcoded 7 based on frontend length
-          room.clueIndex++;
-          room.timer = CLUE_DURATION;
-          io.to(room.roomId).emit('next_clue', room.clueIndex);
-        } else {
-          finishGame(room, 'draw');
-        }
-      }
-    }, 1000);
-  }
-
-  // FINISH GAME HELPER
-  function finishGame(room, winner) {
-    room.stopGame();
-    io.to(room.roomId).emit('game_over', {
-      winner,
-      correctCountry: room.currentCountry,
-      scores: room.scores
-    });
-  }
 
   // GUESS HANDLING
   socket.on('send_guess', ({ roomId, guess, playerNum }) => {
     const room = rooms.get(roomId);
     if (!room || !room.gameActive) return;
 
-    const normalize = (str) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normalize = (str) => str.toLowerCase().replace(/[^a-z0-9]/g, '').trim();
     const target = normalize(room.currentCountry.country);
     const attempt = normalize(guess);
 
     if (attempt === target) {
+      // Correct!
       const winner = playerNum === 1 ? 'player1' : 'player2';
       if (winner === 'player1') room.scores.p1++;
       else room.scores.p2++;
       
       finishGame(room, winner);
     } else {
+      // Incorrect - show bubble
       socket.to(roomId).emit('opponent_guess', guess);
     }
   });
 
   // DISCONNECT
-  socket.on('disconnect', () => {
-    console.log(`❌ Disconnected: ${socket.id}`);
-    for (const [roomId, room] of rooms.entries()) {
-      if (room.players.includes(socket.id)) {
-        room.removePlayer(socket.id);
-        
-        io.to(roomId).emit('player_left');
-        
-        const p1Socket = room.players[0];
-        
-        io.to(roomId).emit('ready_state_update', {
-            p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
-            p2: false
-        });
+  socket.on('disconnect', (reason) => {
+    console.log(`❌ Player ${socket.id} disconnected: ${reason}`);
+    
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
 
-        if (room.players.length === 0) {
-          room.stopGame();
-          rooms.delete(roomId);
-        }
-      }
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.removePlayer(socket.id);
+    
+    // Notify remaining players
+    io.to(roomId).emit('player_left', {
+      playerNum: socket.data.playerNum,
+      remainingPlayers: room.players.length
+    });
+
+    // Update ready states
+    const p1Socket = room.players[0];
+    const p2Socket = room.players[1];
+    
+    io.to(roomId).emit('ready_state_update', {
+      p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
+      p2: false
+    });
+
+    if (room.players.length === 0) {
+      room.stopGame();
+      rooms.delete(roomId);
+      console.log(`🗑️  Room ${roomId} deleted (empty)`);
     }
+  });
+
+  // Error handling
+  socket.on('error', (error) => {
+    console.error(`Socket error for ${socket.id}:`, error);
   });
 });
 
-server.listen(PORT, () => {
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+function startGameLoop(room) {
+  room.stopGame();
+  room.startNewRound();
+
+  // Notify clients game started
+  io.to(room.roomId).emit('game_started', {
+    countryData: room.currentCountry,
+    clueIndex: room.clueIndex,
+    scores: room.scores
+  });
+
+  // Timer Loop
+  room.interval = setInterval(() => {
+    if (!room.gameActive) {
+      clearInterval(room.interval);
+      return;
+    }
+
+    room.timer--;
+    io.to(room.roomId).emit('timer_update', room.timer);
+
+    if (room.timer <= 0) {
+      // Move to next clue
+      if (room.clueIndex < CLUE_SCHEDULE_KEYS.length - 1) {
+        room.clueIndex++;
+        room.timer = CLUE_DURATION;
+        io.to(room.roomId).emit('next_clue', room.clueIndex);
+      } else {
+        // Game Over (Draw)
+        finishGame(room, 'draw');
+      }
+    }
+  }, 1000);
+}
+
+function finishGame(room, winner) {
+  room.stopGame();
+  io.to(room.roomId).emit('game_over', {
+    winner,
+    correctCountry: room.currentCountry,
+    scores: room.scores
+  });
+}
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
+  console.log(`✅ Health check: http://localhost:${PORT}/health`);
+  console.log(`✅ Socket.IO ready`);
+  console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  
+  // Disconnect all sockets
+  io.disconnectSockets();
+  
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
