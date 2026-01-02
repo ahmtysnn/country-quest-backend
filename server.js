@@ -4,7 +4,6 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { COUNTRIES_AND_CITIES } = require('./CountriesAndCities');
 
-const CLUE_DURATION = 15;
 const MAX_PLAYERS = 2;
 
 // ============================================================================
@@ -59,10 +58,14 @@ class GameRoom {
     this.scores = { p1: 0, p2: 0 };
     this.currentCountry = null;
     this.clueIndex = 0;
-    this.timer = CLUE_DURATION;
+    this.timer = null;
     this.interval = null;
     this.createdAt = Date.now();
     this.readyPlayers = new Set();
+    this.settings = null;
+    this.clueSchedule = [];
+    this.maxRounds = null;
+    this.currentRound = 1;
   }
 
   addPlayer(socketId) {
@@ -89,11 +92,53 @@ class GameRoom {
     return this.players.length === MAX_PLAYERS && this.readyPlayers.size === MAX_PLAYERS;
   }
 
+  setSettings(settings) {
+    this.settings = settings;
+    this.timer = settings.clueTime;
+    
+    // Build clue schedule based on enabled clues
+    const DEFAULT_CLUE_SCHEDULE = [
+      { key: 'region', label: 'Region' },
+      { key: 'main_export', label: 'Main Export' },
+      { key: 'population', label: 'Population' },
+      { key: 'currency', label: 'Currency' },
+      { key: 'language', label: 'Language' },
+      { key: 'fun_fact', label: 'Fun Fact' },
+      { key: 'cities', label: 'Major Cities' },
+      { key: 'flag', label: 'Flag' }
+    ];
+    
+    this.clueSchedule = DEFAULT_CLUE_SCHEDULE
+      .filter(clue => settings.enableClues[clue.key])
+      .slice(0, settings.cluesPerRound);
+  }
+
+  getRandomCountry() {
+    // Filter countries by enabled continents
+    let filteredCountries = COUNTRIES_AND_CITIES;
+    
+    if (this.settings && this.settings.enabledContinents.length > 0) {
+      // If "All" is not selected, filter by specific continents
+      if (!this.settings.enabledContinents.includes('All')) {
+        filteredCountries = COUNTRIES_AND_CITIES.filter(country => 
+          this.settings.enabledContinents.includes(country.region)
+        );
+      }
+    }
+    
+    // Ensure we have countries after filtering
+    if (filteredCountries.length === 0) {
+      filteredCountries = COUNTRIES_AND_CITIES; // Fallback to all countries
+    }
+    
+    const randomIndex = Math.floor(Math.random() * filteredCountries.length);
+    return filteredCountries[randomIndex];
+  }
+
   startNewRound() {
-    const randomIndex = Math.floor(Math.random() * COUNTRIES_AND_CITIES.length);
-    this.currentCountry = COUNTRIES_AND_CITIES[randomIndex];
+    this.currentCountry = this.getRandomCountry();
     this.clueIndex = 0;
-    this.timer = CLUE_DURATION;
+    this.timer = this.settings.clueTime;
     this.gameActive = true;
     this.readyPlayers.clear();
   }
@@ -108,7 +153,6 @@ class GameRoom {
 }
 
 const rooms = new Map();
-const CLUE_SCHEDULE_KEYS = ['region', 'main_export', 'population', 'currency', 'language', 'fun_fact', 'cities', 'flag'];
 
 // Cleanup interval
 setInterval(() => {
@@ -138,7 +182,8 @@ io.on('connection', (socket) => {
     }
     
     try {
-      if (!rooms.has(roomId)) {
+      const isNewRoom = !rooms.has(roomId);
+      if (isNewRoom) {
         rooms.set(roomId, new GameRoom(roomId));
         console.log(`📦 Created room: ${roomId}`);
       }
@@ -153,8 +198,12 @@ io.on('connection', (socket) => {
       const playerNum = room.addPlayer(socket.id);
       socket.join(roomId);
       
-      // Send immediate confirmation
-      socket.emit('player_assigned', playerNum);
+      // Send player assignment with settings if they exist
+      socket.emit('player_assigned', { 
+        num: playerNum, 
+        settings: room.settings,
+        isHost: playerNum === 1 && isNewRoom
+      });
       console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
 
       if (room.players.length === MAX_PLAYERS) {
@@ -166,11 +215,62 @@ io.on('connection', (socket) => {
     }
   });
 
+  // SUBMIT SETTINGS (Host only)
+  socket.on('submit_settings', ({ roomId, settings }) => {
+    const room = rooms.get(roomId);
+    if (!room) {
+      socket.emit('error_message', 'Room not found');
+      return;
+    }
+
+    // Only host (player 1) can submit settings
+    if (room.players[0] !== socket.id) {
+      socket.emit('error_message', 'Only the host can set game settings');
+      return;
+    }
+
+    // Validate settings
+    if (!settings || !settings.enableClues || !settings.enabledContinents) {
+      socket.emit('error_message', 'Invalid settings');
+      return;
+    }
+
+    // Validate at least 3 clues are enabled
+    const enabledClueCount = Object.values(settings.enableClues).filter(Boolean).length;
+    if (enabledClueCount < 3) {
+      socket.emit('error_message', 'Please select at least 3 clues');
+      return;
+    }
+
+    // Validate at least one continent is selected
+    if (settings.enabledContinents.length === 0) {
+      socket.emit('error_message', 'Please select at least one continent');
+      return;
+    }
+
+    // Set the settings
+    room.setSettings(settings);
+    console.log(`⚙️ Settings updated for room ${roomId}`);
+
+    // Notify both players about settings
+    io.to(roomId).emit('player_assigned', { 
+      num: 2, 
+      settings: room.settings,
+      isHost: false
+    });
+  });
+
   // TOGGLE READY
   socket.on('toggle_ready', ({ roomId, isReady }) => {
     const room = rooms.get(roomId);
     if (!room) {
       socket.emit('error_message', 'Room not found');
+      return;
+    }
+
+    // Check if settings are set before allowing ready
+    if (room.players[0] === socket.id && !room.settings) {
+      socket.emit('error_message', 'Please set game settings first');
       return;
     }
 
@@ -214,7 +314,8 @@ io.on('connection', (socket) => {
 
     io.to(room.roomId).emit('game_started', {
       countryData: room.currentCountry,
-      clueIndex: room.clueIndex
+      clueIndex: room.clueIndex,
+      settings: room.settings
     });
 
     room.interval = setInterval(() => {
@@ -227,25 +328,36 @@ io.on('connection', (socket) => {
       io.to(room.roomId).emit('timer_update', room.timer);
 
       if (room.timer <= 0) {
-        if (room.clueIndex < CLUE_SCHEDULE_KEYS.length - 1) {
+        if (room.clueIndex < room.clueSchedule.length - 1) {
           room.clueIndex++;
-          room.timer = CLUE_DURATION;
+          room.timer = room.settings.clueTime;
           io.to(room.roomId).emit('next_clue', room.clueIndex);
         } else {
-          finishGame(room, 'draw');
+          // Check if max rounds reached
+          if (room.settings.maxRounds && room.currentRound >= room.settings.maxRounds) {
+            finishGame(room, 'draw', true);
+          } else {
+            room.currentRound++;
+            finishGame(room, 'draw');
+          }
         }
       }
     }, 1000);
   }
 
   // FINISH GAME HELPER
-  function finishGame(room, winner) {
+  function finishGame(room, winner, finalGame = false) {
     room.stopGame();
     io.to(room.roomId).emit('game_over', {
       winner,
       correctCountry: room.currentCountry,
-      scores: room.scores
+      scores: room.scores,
+      finalGame
     });
+    
+    if (finalGame) {
+      console.log(`🏁 Final game completed in ${room.roomId}`);
+    }
   }
 
   // GUESS HANDLING
