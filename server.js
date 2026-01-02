@@ -13,32 +13,43 @@ const MAX_PLAYERS = 2;
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Add these endpoints FIRST
+app.use(cors({ origin: "*" }));
+app.use(express.json());
+
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'Country Quest Backend API',
-    status: 'running',
+    message: 'Country Quest Backend API', 
+    status: 'running', 
     socket: true,
-    timestamp: new Date().toISOString()
+    mode: 'websocket-only'
   });
 });
-
-app.use(cors({ origin: "*" }));
-app.use(express.json());
 
 // Create HTTP server
 const server = http.createServer(app);
 
-// Initialize Socket.io
+// Initialize Socket.io with HIGH PERFORMANCE settings
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "*",
+    origin: "*", // Allow all for smoother connectivity
     methods: ["GET", "POST"],
     credentials: true
+  },
+  // CRITICAL: Force WebSocket to avoid polling delays
+  transports: ['websocket', 'polling'], 
+  // Detect disconnects quickly (default is too slow)
+  pingTimeout: 10000, 
+  pingInterval: 10000,
+  // Helper for mobile/bad connections
+  connectionStateRecovery: {
+    // the backup duration of the sessions and the packets
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    // whether to skip middlewares upon successful recovery
+    skipMiddlewares: true,
   }
 });
 
@@ -48,7 +59,7 @@ const io = new Server(server, {
 class GameRoom {
   constructor(roomId) {
     this.roomId = roomId;
-    this.players = []; // Array of socket IDs. Index 0 is Player 1 (Host)
+    this.players = []; 
     this.gameActive = false;
     this.scores = { p1: 0, p2: 0 };
     this.currentCountry = null;
@@ -56,13 +67,13 @@ class GameRoom {
     this.timer = CLUE_DURATION;
     this.interval = null;
     this.createdAt = Date.now();
-    this.readyPlayers = new Set(); // Track which socket IDs are ready
+    this.readyPlayers = new Set();
   }
 
   addPlayer(socketId) {
     if (this.players.length >= MAX_PLAYERS) return null;
     this.players.push(socketId);
-    return this.players.length; // Returns 1 or 2
+    return this.players.length; 
   }
 
   removePlayer(socketId) {
@@ -89,9 +100,6 @@ class GameRoom {
     this.clueIndex = 0;
     this.timer = CLUE_DURATION;
     this.gameActive = true;
-    
-    // Clear ready status so they have to ready up again if they go back to lobby
-    // (Though for 'Restart' we bypass this check)
     this.readyPlayers.clear();
   }
 
@@ -121,7 +129,7 @@ setInterval(() => {
 // SOCKET.IO LOGIC
 // ============================================================================
 io.on('connection', (socket) => {
-  console.log(`✅ Player connected: ${socket.id}`);
+  console.log(`⚡ Fast Connect: ${socket.id}`);
 
   // JOIN ROOM
   socket.on('join_room', (roomId) => {
@@ -133,6 +141,12 @@ io.on('connection', (socket) => {
     }
 
     const room = rooms.get(roomId);
+
+    // If player is already in this room (reconnection logic), don't add them again
+    if (room.players.includes(socket.id)) {
+        socket.emit('player_assigned', room.players.indexOf(socket.id) + 1);
+        return;
+    }
 
     if (room.players.length >= MAX_PLAYERS) {
       socket.emit('error_message', 'Room is full!');
@@ -146,19 +160,17 @@ io.on('connection', (socket) => {
     console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
 
     if (room.players.length === MAX_PLAYERS) {
-      io.to(roomId).emit('room_ready'); // Moves users to "Waiting" screen
+      io.to(roomId).emit('room_ready'); 
     }
   });
 
-  // TOGGLE READY (Lobby Phase)
+  // TOGGLE READY 
   socket.on('toggle_ready', ({ roomId, isReady }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
     room.setReady(socket.id, isReady);
 
-    // Send updated statuses to everyone in room
-    // Map socket IDs to P1/P2 ready booleans
     const p1Socket = room.players[0];
     const p2Socket = room.players[1];
 
@@ -167,25 +179,20 @@ io.on('connection', (socket) => {
       p2: room.readyPlayers.has(p2Socket)
     });
 
-    // Check if game should start
     if (room.areAllReady()) {
-      console.log(`🚀 All players ready in ${roomId}. Starting game...`);
       startGameLoop(room);
     }
   });
 
-  // RESTART GAME (Game Over Phase)
+  // RESTART GAME 
   socket.on('restart_game', (roomId) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    // Only Player 1 (index 0) is allowed to restart
     if (room.players[0] !== socket.id) {
         socket.emit('error_message', "Only the Host (Player 1) can restart.");
         return;
     }
-
-    console.log(`🔄 Host restarted game in ${roomId}`);
     startGameLoop(room);
   });
 
@@ -194,13 +201,11 @@ io.on('connection', (socket) => {
     room.stopGame();
     room.startNewRound();
 
-    // Notify clients game started
     io.to(room.roomId).emit('game_started', {
       countryData: room.currentCountry,
       clueIndex: room.clueIndex
     });
 
-    // Timer Loop
     room.interval = setInterval(() => {
       if (!room.gameActive) {
         clearInterval(room.interval);
@@ -211,13 +216,11 @@ io.on('connection', (socket) => {
       io.to(room.roomId).emit('timer_update', room.timer);
 
       if (room.timer <= 0) {
-        // Move to next clue
-        if (room.clueIndex < CLUE_SCHEDULE_KEYS.length - 1) {
+        if (room.clueIndex < 7) { // Hardcoded 7 based on frontend length
           room.clueIndex++;
           room.timer = CLUE_DURATION;
           io.to(room.roomId).emit('next_clue', room.clueIndex);
         } else {
-          // Game Over (Draw)
           finishGame(room, 'draw');
         }
       }
@@ -244,14 +247,12 @@ io.on('connection', (socket) => {
     const attempt = normalize(guess);
 
     if (attempt === target) {
-      // Correct!
       const winner = playerNum === 1 ? 'player1' : 'player2';
       if (winner === 'player1') room.scores.p1++;
       else room.scores.p2++;
       
       finishGame(room, winner);
     } else {
-      // Incorrect - show bubble
       socket.to(roomId).emit('opponent_guess', guess);
     }
   });
@@ -263,12 +264,10 @@ io.on('connection', (socket) => {
       if (room.players.includes(socket.id)) {
         room.removePlayer(socket.id);
         
-        // Notify clients to reset UI if someone leaves
         io.to(roomId).emit('player_left');
         
-        // Broadcast new ready states (in case the ready person left)
         const p1Socket = room.players[0];
-        const p2Socket = room.players[1]; // likely undefined now
+        
         io.to(roomId).emit('ready_state_update', {
             p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
             p2: false
@@ -285,6 +284,4 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`✅ Health check: http://localhost:${PORT}/health`);
-  console.log(`✅ Socket.IO ready`);
 });
