@@ -202,7 +202,13 @@ io.on('connection', (socket) => {
 
       if (room.players.length >= MAX_PLAYERS) {
         socket.emit('error_message', 'Room is full!');
+        socket.emit('room_full_redirect'); // Tell client to go back to lobby
         return;
+      }
+
+      // If player is already in this room, don't add again
+      if (room.players.includes(socket.id)) {
+          return; 
       }
 
       const playerNum = room.addPlayer(socket.id);
@@ -212,7 +218,7 @@ io.on('connection', (socket) => {
       socket.emit('player_assigned', { 
         num: playerNum, 
         settings: room.settings,
-        isHost: playerNum === 1 && isNewRoom
+        isHost: playerNum === 1
       });
       console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
 
