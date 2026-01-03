@@ -38,7 +38,7 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
     credentials: true
   },
-  transports: ['websocket', 'polling'],
+  transports: ['websocket', 'polling'], // Allow both but prefer websocket
   allowUpgrades: true,
   pingTimeout: 30000,
   pingInterval: 25000,
@@ -51,11 +51,9 @@ const io = new Server(server, {
 // GAME STATE MANAGEMENT
 // ============================================================================
 class GameRoom {
-  constructor(roomId, hostSocketId) {
+  constructor(roomId) {
     this.roomId = roomId;
-    this.hostSocketId = hostSocketId; // Store the host's socket ID
     this.players = [];
-    this.playerNumbers = new Map(); // Map socket IDs to player numbers
     this.gameActive = false;
     this.scores = { p1: 0, p2: 0 };
     this.currentCountry = null;
@@ -72,19 +70,8 @@ class GameRoom {
 
   addPlayer(socketId) {
     if (this.players.length >= MAX_PLAYERS) return null;
-    
     this.players.push(socketId);
-    
-    // Assign player number: host is always player 1, second player is player 2
-    let playerNum;
-    if (socketId === this.hostSocketId) {
-      playerNum = 1;
-    } else {
-      playerNum = 2;
-    }
-    
-    this.playerNumbers.set(socketId, playerNum);
-    return playerNum;
+    return this.players.length;
   }
 
   removePlayer(socketId) {
@@ -92,25 +79,13 @@ class GameRoom {
     if (index > -1) {
       this.players.splice(index, 1);
     }
-    this.playerNumbers.delete(socketId);
     this.readyPlayers.delete(socketId);
     return this.players.length;
   }
 
-  getPlayerNumber(socketId) {
-    return this.playerNumbers.get(socketId);
-  }
-
-  isHost(socketId) {
-    return socketId === this.hostSocketId;
-  }
-
   setReady(socketId, isReady) {
-    if (isReady) {
-      this.readyPlayers.add(socketId);
-    } else {
-      this.readyPlayers.delete(socketId);
-    }
+    if (isReady) this.readyPlayers.add(socketId);
+    else this.readyPlayers.delete(socketId);
   }
 
   areAllReady() {
@@ -208,73 +183,31 @@ io.on('connection', (socket) => {
     
     try {
       const isNewRoom = !rooms.has(roomId);
-      let room;
-      
       if (isNewRoom) {
-        // Create new room with this socket as host
-        room = new GameRoom(roomId, socket.id);
-        rooms.set(roomId, room);
-        console.log(`📦 Created room: ${roomId} with host: ${socket.id}`);
-      } else {
-        room = rooms.get(roomId);
+        rooms.set(roomId, new GameRoom(roomId));
+        console.log(`📦 Created room: ${roomId}`);
       }
+
+      const room = rooms.get(roomId);
 
       if (room.players.length >= MAX_PLAYERS) {
         socket.emit('error_message', 'Room is full!');
         return;
       }
 
-      // Check if player is already in the room (reconnection)
-      const isReconnecting = room.players.includes(socket.id);
+      const playerNum = room.addPlayer(socket.id);
+      socket.join(roomId);
       
-      if (!isReconnecting) {
-        const playerNum = room.addPlayer(socket.id);
-        socket.join(roomId);
-        
-        // Send player assignment with proper host identification
-        socket.emit('player_assigned', { 
-          num: playerNum, 
-          settings: room.settings,
-          isHost: room.isHost(socket.id)
-        });
-        
-        console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum} ${room.isHost(socket.id) ? '(Host)' : ''}`);
-        
-        // If this is the second player joining, notify both players
-        if (room.players.length === MAX_PLAYERS) {
-          io.to(roomId).emit('room_ready');
-          
-          // Ensure both players have correct player numbers
-          room.players.forEach(playerSocketId => {
-            const playerRoom = rooms.get(roomId);
-            if (playerRoom) {
-              const playerNum = playerRoom.getPlayerNumber(playerSocketId);
-              const isHost = playerRoom.isHost(playerSocketId);
-              io.to(playerSocketId).emit('player_assigned', {
-                num: playerNum,
-                settings: room.settings,
-                isHost: isHost
-              });
-            }
-          });
-        } else if (room.players.length === 1) {
-          // First player (host) waiting for second player
-          socket.emit('room_waiting');
-        }
-      } else {
-        // Reconnection - send current state
-        const playerNum = room.getPlayerNumber(socket.id);
-        socket.emit('player_assigned', { 
-          num: playerNum, 
-          settings: room.settings,
-          isHost: room.isHost(socket.id)
-        });
-        
-        if (room.players.length === MAX_PLAYERS) {
-          socket.emit('room_ready');
-        } else {
-          socket.emit('room_waiting');
-        }
+      // Send player assignment with settings if they exist
+      socket.emit('player_assigned', { 
+        num: playerNum, 
+        settings: room.settings,
+        isHost: playerNum === 1 && isNewRoom
+      });
+      console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
+
+      if (room.players.length === MAX_PLAYERS) {
+        io.to(roomId).emit('room_ready');
       }
     } catch (error) {
       console.error('Error joining room:', error);
@@ -290,8 +223,8 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Only host can submit settings
-    if (!room.isHost(socket.id)) {
+    // Only host (player 1) can submit settings
+    if (room.players[0] !== socket.id) {
       socket.emit('error_message', 'Only the host can set game settings');
       return;
     }
@@ -302,10 +235,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Validate at least 1 clue is enabled
+    // Validate at least 3 clues are enabled
     const enabledClueCount = Object.values(settings.enableClues).filter(Boolean).length;
-    if (enabledClueCount < 1) {
-      socket.emit('error_message', 'Please select at least 1 clue');
+    if (enabledClueCount < 3) {
+      socket.emit('error_message', 'Please select at least 3 clues');
       return;
     }
 
@@ -320,42 +253,11 @@ io.on('connection', (socket) => {
     console.log(`⚙️ Settings updated for room ${roomId}`);
 
     // Notify both players about settings
-    io.to(roomId).emit('settings_updated', room.settings);
-    
-    // Update player assignments with new settings and reset ready states
-    room.readyPlayers.clear(); // Clear all ready states when settings change
-    
-    // Get player sockets
-    const p1Socket = Array.from(room.playerNumbers.entries()).find(([_, num]) => num === 1)?.[0];
-    const p2Socket = Array.from(room.playerNumbers.entries()).find(([_, num]) => num === 2)?.[0];
-    
-    // Update both players
-    if (p1Socket) {
-      io.to(p1Socket).emit('player_assigned', {
-        num: 1,
-        settings: room.settings,
-        isHost: room.isHost(p1Socket)
-      });
-    }
-    
-    if (p2Socket) {
-      io.to(p2Socket).emit('player_assigned', {
-        num: 2,
-        settings: room.settings,
-        isHost: room.isHost(p2Socket)
-      });
-    }
-    
-    // Update ready status for both players (both false after settings change)
-    io.to(roomId).emit('ready_state_update', {
-      p1: false,
-      p2: false
+    io.to(roomId).emit('player_assigned', { 
+      num: 2, 
+      settings: room.settings,
+      isHost: false
     });
-    
-    // If both players are connected, emit room_ready
-    if (room.players.length === MAX_PLAYERS) {
-      io.to(roomId).emit('room_ready');
-    }
   });
 
   // TOGGLE READY
@@ -367,20 +269,19 @@ io.on('connection', (socket) => {
     }
 
     // Check if settings are set before allowing ready
-    if (!room.settings) {
-      socket.emit('error_message', 'Game settings are not configured yet');
+    if (room.players[0] === socket.id && !room.settings) {
+      socket.emit('error_message', 'Please set game settings first');
       return;
     }
 
     room.setReady(socket.id, isReady);
 
-    // Get player numbers for both players
-    const p1Socket = Array.from(room.playerNumbers.entries()).find(([_, num]) => num === 1)?.[0];
-    const p2Socket = Array.from(room.playerNumbers.entries()).find(([_, num]) => num === 2)?.[0];
+    const p1Socket = room.players[0];
+    const p2Socket = room.players[1];
 
     io.to(roomId).emit('ready_state_update', {
-      p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
-      p2: p2Socket ? room.readyPlayers.has(p2Socket) : false
+      p1: room.readyPlayers.has(p1Socket),
+      p2: room.readyPlayers.has(p2Socket)
     });
 
     if (room.areAllReady()) {
@@ -397,7 +298,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (!room.isHost(socket.id)) {
+    if (room.players[0] !== socket.id) {
       socket.emit('error_message', "Only the Host (Player 1) can restart.");
       return;
     }
@@ -411,8 +312,6 @@ io.on('connection', (socket) => {
     room.stopGame();
     room.startNewRound();
 
-    console.log(`🎮 Starting game in room ${room.roomId} with country: ${room.currentCountry.country}`);
-    
     io.to(room.roomId).emit('game_started', {
       countryData: room.currentCountry,
       clueIndex: room.clueIndex,
@@ -490,11 +389,8 @@ io.on('connection', (socket) => {
         
         io.to(roomId).emit('player_left');
         
-        // Get remaining player's ready status
-        const remainingPlayers = Array.from(room.playerNumbers.entries());
-        const p1Socket = remainingPlayers.find(([_, num]) => num === 1)?.[0];
-        const p2Socket = remainingPlayers.find(([_, num]) => num === 2)?.[0];
-        
+        const p1Socket = room.players[0];
+        const p2Socket = room.players[1];
         io.to(roomId).emit('ready_state_update', {
           p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
           p2: false
@@ -503,21 +399,6 @@ io.on('connection', (socket) => {
         if (room.players.length === 0) {
           room.stopGame();
           rooms.delete(roomId);
-        } else if (room.isHost(socket.id)) {
-          // If host left, assign new host (player 2 becomes host)
-          const newHost = room.players[0];
-          if (newHost) {
-            // Update player numbers - new host becomes player 1
-            room.playerNumbers.set(newHost, 1);
-            room.hostSocketId = newHost;
-            
-            // Notify remaining player they are now host
-            io.to(newHost).emit('player_assigned', {
-              num: 1,
-              settings: room.settings,
-              isHost: true
-            });
-          }
         }
       }
     }
