@@ -12,7 +12,6 @@ const MAX_PLAYERS = 2;
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Health check endpoints
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
@@ -31,20 +30,16 @@ app.use(express.json());
 
 const server = http.createServer(app);
 
-// Optimized Socket.io configuration
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
     credentials: true
   },
-  transports: ['websocket', 'polling'], // Allow both but prefer websocket
+  transports: ['websocket', 'polling'],
   allowUpgrades: true,
   pingTimeout: 30000,
-  pingInterval: 25000,
-  connectTimeout: 10000,
-  maxHttpBufferSize: 1e6,
-  allowEIO3: true
+  pingInterval: 25000
 });
 
 // ============================================================================
@@ -53,7 +48,10 @@ const io = new Server(server, {
 class GameRoom {
   constructor(roomId) {
     this.roomId = roomId;
-    this.players = [];
+    // FIX: Use an object for fixed slots instead of an array
+    this.players = { 1: null, 2: null }; 
+    this.host = null; // FIX: Explicitly track the host socket ID
+    
     this.gameActive = false;
     this.scores = { p1: 0, p2: 0 };
     this.currentCountry = null;
@@ -68,19 +66,51 @@ class GameRoom {
     this.currentRound = 1;
   }
 
+  // FIX: Assign to specific empty slot (1 or 2)
   addPlayer(socketId) {
-    if (this.players.length >= MAX_PLAYERS) return null;
-    this.players.push(socketId);
-    return this.players.length;
+    if (this.players[1] && this.players[2]) return null; // Room full
+
+    let assignedNum = null;
+    if (!this.players[1]) {
+      this.players[1] = socketId;
+      assignedNum = 1;
+    } else {
+      this.players[2] = socketId;
+      assignedNum = 2;
+    }
+
+    // Assign host if none exists
+    if (!this.host) {
+      this.host = socketId;
+    }
+
+    return assignedNum;
   }
 
   removePlayer(socketId) {
-    const index = this.players.indexOf(socketId);
-    if (index > -1) {
-      this.players.splice(index, 1);
+    let playerNumToRemove = null;
+    if (this.players[1] === socketId) playerNumToRemove = 1;
+    else if (this.players[2] === socketId) playerNumToRemove = 2;
+
+    if (playerNumToRemove) {
+      this.players[playerNumToRemove] = null;
+      this.readyPlayers.delete(socketId);
+
+      // FIX: Host migration logic
+      if (this.host === socketId) {
+        // If host left, assign host to the other player if they exist
+        const otherPlayerNum = playerNumToRemove === 1 ? 2 : 1;
+        if (this.players[otherPlayerNum]) {
+          this.host = this.players[otherPlayerNum];
+        } else {
+          this.host = null;
+        }
+      }
     }
-    this.readyPlayers.delete(socketId);
-    return this.players.length;
+  }
+
+  getPlayerCount() {
+    return (this.players[1] ? 1 : 0) + (this.players[2] ? 1 : 0);
   }
 
   setReady(socketId, isReady) {
@@ -89,14 +119,14 @@ class GameRoom {
   }
 
   areAllReady() {
-    return this.players.length === MAX_PLAYERS && this.readyPlayers.size === MAX_PLAYERS;
+    // Check if both slots are filled AND both are ready
+    return this.players[1] && this.players[2] && this.readyPlayers.size === 2;
   }
 
   setSettings(settings) {
     this.settings = settings;
     this.timer = settings.clueTime;
     
-    // Build clue schedule based on enabled clues
     const DEFAULT_CLUE_SCHEDULE = [
       { key: 'region', label: 'Region' },
       { key: 'main_export', label: 'Main Export' },
@@ -114,11 +144,9 @@ class GameRoom {
   }
 
   getRandomCountry() {
-    // Filter countries by enabled continents
     let filteredCountries = COUNTRIES_AND_CITIES;
     
     if (this.settings && this.settings.enabledContinents.length > 0) {
-      // If "All" is not selected, filter by specific continents
       if (!this.settings.enabledContinents.includes('All')) {
         filteredCountries = COUNTRIES_AND_CITIES.filter(country => 
           this.settings.enabledContinents.includes(country.region)
@@ -126,9 +154,8 @@ class GameRoom {
       }
     }
     
-    // Ensure we have countries after filtering
     if (filteredCountries.length === 0) {
-      filteredCountries = COUNTRIES_AND_CITIES; // Fallback to all countries
+      filteredCountries = COUNTRIES_AND_CITIES;
     }
     
     const randomIndex = Math.floor(Math.random() * filteredCountries.length);
@@ -158,7 +185,7 @@ const rooms = new Map();
 setInterval(() => {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
-    if (room.players.length === 0 && now - room.createdAt > 30 * 60 * 1000) {
+    if (room.getPlayerCount() === 0 && now - room.createdAt > 30 * 60 * 1000) {
       room.stopGame();
       rooms.delete(roomId);
     }
@@ -171,7 +198,6 @@ setInterval(() => {
 io.on('connection', (socket) => {
   console.log(`✅ Player connected: ${socket.id}`);
 
-  // Send immediate confirmation
   socket.emit('connection_confirmed', { socketId: socket.id });
 
   // JOIN ROOM
@@ -182,15 +208,14 @@ io.on('connection', (socket) => {
     }
     
     try {
-      const isNewRoom = !rooms.has(roomId);
-      if (isNewRoom) {
+      if (!rooms.has(roomId)) {
         rooms.set(roomId, new GameRoom(roomId));
         console.log(`📦 Created room: ${roomId}`);
       }
 
       const room = rooms.get(roomId);
 
-      if (room.players.length >= MAX_PLAYERS) {
+      if (room.getPlayerCount() >= MAX_PLAYERS) {
         socket.emit('error_message', 'Room is full!');
         return;
       }
@@ -198,17 +223,27 @@ io.on('connection', (socket) => {
       const playerNum = room.addPlayer(socket.id);
       socket.join(roomId);
       
-      // Send player assignment with settings if they exist
+      // FIX: Send correct host status based on stored host
       socket.emit('player_assigned', { 
         num: playerNum, 
         settings: room.settings,
-        isHost: playerNum === 1 && isNewRoom
+        isHost: room.host === socket.id
       });
+
       console.log(`👤 Player ${socket.id} joined ${roomId} as P${playerNum}`);
 
-      if (room.players.length === MAX_PLAYERS) {
+      // Notify others that ready state might have changed (or player rejoined)
+      const p1Socket = room.players[1];
+      const p2Socket = room.players[2];
+      io.to(roomId).emit('ready_state_update', {
+        p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
+        p2: p2Socket ? room.readyPlayers.has(p2Socket) : false
+      });
+
+      if (room.getPlayerCount() === MAX_PLAYERS) {
         io.to(roomId).emit('room_ready');
       }
+
     } catch (error) {
       console.error('Error joining room:', error);
       socket.emit('error_message', 'Failed to join room');
@@ -218,70 +253,55 @@ io.on('connection', (socket) => {
   // SUBMIT SETTINGS (Host only)
   socket.on('submit_settings', ({ roomId, settings }) => {
     const room = rooms.get(roomId);
-    if (!room) {
-      socket.emit('error_message', 'Room not found');
-      return;
-    }
+    if (!room) return;
 
-    // Only host (player 1) can submit settings
-    if (room.players[0] !== socket.id) {
+    // FIX: Verify against the stored host ID
+    if (room.host !== socket.id) {
       socket.emit('error_message', 'Only the host can set game settings');
       return;
     }
 
-    // Validate settings
     if (!settings || !settings.enableClues || !settings.enabledContinents) {
       socket.emit('error_message', 'Invalid settings');
       return;
     }
 
-    // Validate at least 3 clues are enabled
     const enabledClueCount = Object.values(settings.enableClues).filter(Boolean).length;
-    if (enabledClueCount < 3) {
-      socket.emit('error_message', 'Please select at least 3 clues');
+    if (enabledClueCount < 1) { // Changed to 1 based on your frontend request
+      socket.emit('error_message', 'Please select at least 1 clue');
       return;
     }
 
-    // Validate at least one continent is selected
     if (settings.enabledContinents.length === 0) {
       socket.emit('error_message', 'Please select at least one continent');
       return;
     }
 
-    // Set the settings
     room.setSettings(settings);
     console.log(`⚙️ Settings updated for room ${roomId}`);
 
-    // Notify both players about settings
-    io.to(roomId).emit('player_assigned', { 
-      num: 2, 
-      settings: room.settings,
-      isHost: false
-    });
+    // Notify everyone
+    io.to(roomId).emit('settings_updated', room.settings);
   });
 
   // TOGGLE READY
   socket.on('toggle_ready', ({ roomId, isReady }) => {
     const room = rooms.get(roomId);
-    if (!room) {
-      socket.emit('error_message', 'Room not found');
-      return;
-    }
+    if (!room) return;
 
-    // Check if settings are set before allowing ready
-    if (room.players[0] === socket.id && !room.settings) {
+    if (room.host === socket.id && !room.settings) {
       socket.emit('error_message', 'Please set game settings first');
       return;
     }
 
     room.setReady(socket.id, isReady);
 
-    const p1Socket = room.players[0];
-    const p2Socket = room.players[1];
+    const p1Socket = room.players[1];
+    const p2Socket = room.players[2];
 
     io.to(roomId).emit('ready_state_update', {
-      p1: room.readyPlayers.has(p1Socket),
-      p2: room.readyPlayers.has(p2Socket)
+      p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
+      p2: p2Socket ? room.readyPlayers.has(p2Socket) : false
     });
 
     if (room.areAllReady()) {
@@ -293,13 +313,10 @@ io.on('connection', (socket) => {
   // RESTART GAME
   socket.on('restart_game', (roomId) => {
     const room = rooms.get(roomId);
-    if (!room) {
-      socket.emit('error_message', 'Room not found');
-      return;
-    }
+    if (!room) return;
 
-    if (room.players[0] !== socket.id) {
-      socket.emit('error_message', "Only the Host (Player 1) can restart.");
+    if (room.host !== socket.id) {
+      socket.emit('error_message', "Only the Host can restart.");
       return;
     }
 
@@ -307,7 +324,6 @@ io.on('connection', (socket) => {
     startGameLoop(room);
   });
 
-  // GAME LOOP HELPER
   function startGameLoop(room) {
     room.stopGame();
     room.startNewRound();
@@ -333,7 +349,6 @@ io.on('connection', (socket) => {
           room.timer = room.settings.clueTime;
           io.to(room.roomId).emit('next_clue', room.clueIndex);
         } else {
-          // Check if max rounds reached
           if (room.settings.maxRounds && room.currentRound >= room.settings.maxRounds) {
             finishGame(room, 'draw', true);
           } else {
@@ -345,7 +360,6 @@ io.on('connection', (socket) => {
     }, 1000);
   }
 
-  // FINISH GAME HELPER
   function finishGame(room, winner, finalGame = false) {
     room.stopGame();
     io.to(room.roomId).emit('game_over', {
@@ -354,13 +368,8 @@ io.on('connection', (socket) => {
       scores: room.scores,
       finalGame
     });
-    
-    if (finalGame) {
-      console.log(`🏁 Final game completed in ${room.roomId}`);
-    }
   }
 
-  // GUESS HANDLING
   socket.on('send_guess', ({ roomId, guess, playerNum }) => {
     const room = rooms.get(roomId);
     if (!room || !room.gameActive) return;
@@ -380,23 +389,36 @@ io.on('connection', (socket) => {
     }
   });
 
-  // DISCONNECT
   socket.on('disconnect', () => {
     console.log(`❌ Disconnected: ${socket.id}`);
     for (const [roomId, room] of rooms.entries()) {
-      if (room.players.includes(socket.id)) {
+      // Check if this socket was P1 or P2
+      if (room.players[1] === socket.id || room.players[2] === socket.id) {
         room.removePlayer(socket.id);
         
+        // Notify frontend player left
         io.to(roomId).emit('player_left');
         
-        const p1Socket = room.players[0];
-        const p2Socket = room.players[1];
+        // If Host migrated, we need to tell the remaining player they might be host now
+        // The easiest way is to re-emit assignment info or just let them know via update
+        if (room.players[1] || room.players[2]) {
+           const remainingPlayerNum = room.players[1] ? 1 : 2;
+           const remainingSocketId = room.players[remainingPlayerNum];
+           
+           // Inform the remaining player if they are now host
+           if (room.host === remainingSocketId) {
+             io.to(remainingSocketId).emit('host_migration', true);
+           }
+        }
+
+        const p1Socket = room.players[1];
+        const p2Socket = room.players[2];
         io.to(roomId).emit('ready_state_update', {
           p1: p1Socket ? room.readyPlayers.has(p1Socket) : false,
-          p2: false
+          p2: p2Socket ? room.readyPlayers.has(p2Socket) : false
         });
 
-        if (room.players.length === 0) {
+        if (room.getPlayerCount() === 0) {
           room.stopGame();
           rooms.delete(roomId);
         }
@@ -404,7 +426,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Heartbeat for connection health
   socket.on('ping', () => {
     socket.emit('pong');
   });
@@ -412,6 +433,4 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`✅ Health check: http://localhost:${PORT}/health`);
-  console.log(`✅ Socket.IO ready`);
 });
